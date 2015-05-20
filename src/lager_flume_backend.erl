@@ -19,7 +19,8 @@
 -include("gen-erl/flume_types.hrl").
 
 -record(state, {id, level, formatter, format_config,
-				client, last_time, host, port}).
+				client, last_time, host, port,
+				shaper}).
 
 -define(DEFAULT_FORMAT,[date, " ", time,
 						" [", severity, "] ",
@@ -51,7 +52,8 @@ init([Host, Port, Level, {Formatter, FormatterConfig}]) when is_atom(Formatter) 
 								client = Client,
 								last_time = Last,
 								host = Host,
-								port = Port}}
+								port = Port,
+								shaper = #lager_shaper{hwm = undefined}}}
 			catch
 				_:_ ->
 					{error, bad_log_level}
@@ -94,6 +96,13 @@ handle_call({set_loglevel, Level}, State) ->
         _:_ ->
             {ok, {error, bad_log_level}, State}
     end;
+handle_call({set_loghwm, Hwm}, #state{shaper=Shaper} = State) ->
+	case is_integer(Hwm) andalso Hwm > 0 of
+	   true ->
+            {ok, ok, State#state{shaper=Shaper#lager_shaper{hwm=Hwm}}};
+		false ->
+            {ok, {error, bad_log_hwm}, State}
+    end;
 handle_call(_Request, State) ->
     {ok, ok, State}.
 
@@ -120,14 +129,25 @@ handle_event({log, Message}, #state{level = Level,
 handle_event({log, Message}, #state{level=Level,
 									formatter=Formatter,
 									format_config=FormatConfig,
-									client = Client} = State) ->
+									client = Client,
+									shaper = Shaper} = State) ->
     case lager_util:is_loggable(Message, Level, State#state.id) of
         true ->
-			MsgBody = Formatter:format(Message, FormatConfig),
-			Event = #'ThriftFlumeEvent'{
-					   body = lists:flatten(MsgBody)},
-			Client1 = to_flume(Client, Event),
-            {ok, State#state{client=Client1}};
+			case lager_util:check_hwm(Shaper) of
+				{true, Drop, #lager_shaper{hwm=Hwm} = NewShaper1} ->
+					Client1 = case Drop > 0 of
+								  true ->
+									  Report = limit_message(Drop, Hwm),
+									  to_flume(Client, Report, 
+											   Formatter, FormatConfig);
+								  _ ->
+									  Client
+							  end,
+					Client2 = to_flume(Client1, Message, Formatter, FormatConfig),
+					{ok, State#state{client=Client2, shaper=NewShaper1}};
+				{false, _, NewShaper2} ->
+					{ok, State#state{shaper=NewShaper2}}
+			end;
         false ->
             {ok, State}
     end;
@@ -146,7 +166,11 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-to_flume(Client, Event) ->
+limit_message(Drop, Hwm) ->
+	LimitMessage = io_lib:format("lager_flume_backend dropped ~p messages in the last second that exceeded the limit of ~p messages/sec", [Drop, Hwm]),
+	lager_msg:new(LimitMessage, warning, [], []).
+
+to_flume(Client, Event) when is_record(Event, 'ThriftFlumeEvent')->
 	{Client1, Res} = (catch thrift_client:send_call(Client, append, [Event])),
 	case Res of 
 		ok ->
@@ -166,6 +190,12 @@ to_flume(Client, Event) ->
 			?INT_LOG(error, "Unknown monster from flume server: ~p~n", [Unknown]),
 			undefined
 	end.
+
+to_flume(Client, Message, Formatter, FormatConfig) ->
+	MsgBody = Formatter:format(Message, FormatConfig),
+	Event = #'ThriftFlumeEvent'{
+			   body = lists:flatten(MsgBody)},
+	to_flume(Client, Event).
 
 %% convert the configuration into a hopefully unique gen_event ID
 config_to_id([Host, Port, _Level]) ->
