@@ -15,12 +15,13 @@
 -export([config_to_id/1]).
 
 -include_lib("lager/include/lager.hrl").
+%%-include_lib("lager.hrl").
 -include("gen-erl/thrift_source_protocol_thrift.hrl").
 -include("gen-erl/flume_types.hrl").
 
 -record(state, {id, level, formatter, format_config,
 				client, last_time, host, port,
-				shaper}).
+				shaper, batch_size, buffer}).
 
 -define(DEFAULT_FORMAT,[date, " ", time,
 						" [", severity, "] ",
@@ -34,11 +35,17 @@
 
 -define(NET_TIMEOUT, 1000). %% in milliseconds
 -define(RECONNECT_INTERVAL, 1000000). %% in microseconds
+-define(DEFAULT_BATCH_SIZE, 1).
 
 %% @private
 init([Host, Port, Level]) ->
-    init([Host, Port, Level, {lager_default_formatter, ?DEFAULT_FORMAT}]);
-init([Host, Port, Level, {Formatter, FormatterConfig}]) when is_atom(Formatter) ->
+    init([Host, Port, Level, ?DEFAULT_BATCH_SIZE]);
+
+init([Host, Port, Level, BatchSize]) ->
+    init([Host, Port, Level, BatchSize, 
+		  {lager_default_formatter, ?DEFAULT_FORMAT}]);
+init([Host, Port, Level, BatchSize, 
+	  {Formatter, FormatterConfig}]) when is_atom(Formatter) ->
     case reconnect(Host, Port) of
         {error, Reason} ->
 			{error, Reason};
@@ -53,7 +60,9 @@ init([Host, Port, Level, {Formatter, FormatterConfig}]) when is_atom(Formatter) 
 								last_time = Last,
 								host = Host,
 								port = Port,
-								shaper = #lager_shaper{hwm = undefined}}}
+								shaper = #lager_shaper{hwm = undefined},
+								batch_size = BatchSize,
+								buffer = queue:new()}}
 			catch
 				_:_ ->
 					{error, bad_log_level}
@@ -98,7 +107,7 @@ handle_call({set_loglevel, Level}, State) ->
     end;
 handle_call({set_loghwm, Hwm}, #state{shaper=Shaper} = State) ->
 	case is_integer(Hwm) andalso Hwm > 0 of
-	   true ->
+		true ->
             {ok, ok, State#state{shaper=Shaper#lager_shaper{hwm=Hwm}}};
 		false ->
             {ok, {error, bad_log_hwm}, State}
@@ -127,30 +136,40 @@ handle_event({log, Message}, #state{level = Level,
     end;
 
 handle_event({log, Message}, #state{level=Level,
-									formatter=Formatter,
-									format_config=FormatConfig,
-									client = Client,
 									shaper = Shaper} = State) ->
     case lager_util:is_loggable(Message, Level, State#state.id) of
         true ->
 			case lager_util:check_hwm(Shaper) of
 				{true, Drop, #lager_shaper{hwm=Hwm} = NewShaper1} ->
-					Client1 = case Drop > 0 of
+					State1 = case Drop > 0 of
 								  true ->
 									  Report = limit_message(Drop, Hwm),
-									  to_flume(Client, Report, 
-											   Formatter, FormatConfig);
+									  buffering(Report, State);
 								  _ ->
-									  Client
+									  State
 							  end,
-					Client2 = to_flume(Client1, Message, Formatter, FormatConfig),
-					{ok, State#state{client=Client2, shaper=NewShaper1}};
+					State2 = buffering(Message, State1),
+					{ok, State2#state{shaper=NewShaper1}};
 				{false, _, NewShaper2} ->
 					{ok, State#state{shaper=NewShaper2}}
 			end;
         false ->
             {ok, State}
     end;
+
+handle_event(flush, #state{formatter=Formatter,
+						   format_config=FormatConfig,
+						   client = Client,
+						   buffer = Buffer} = State) ->
+	Events = lists:map(
+			   fun(Message) ->					   
+					   MsgBody = Formatter:format(Message, FormatConfig),
+					   #'ThriftFlumeEvent'{body = lists:flatten(MsgBody)}
+			   end, queue:to_list(Buffer)),
+
+	Client1 = to_flume(Events, Client),
+	{ok, State#state{client=Client1, buffer = queue:new()}};
+
 handle_event(_Event, State) ->
     {ok, State}.
 
@@ -170,8 +189,28 @@ limit_message(Drop, Hwm) ->
 	LimitMessage = io_lib:format("lager_flume_backend dropped ~p messages in the last second that exceeded the limit of ~p messages/sec", [Drop, Hwm]),
 	lager_msg:new(LimitMessage, warning, [], []).
 
-to_flume(Client, Event) when is_record(Event, 'ThriftFlumeEvent')->
-	{Client1, Res} = (catch thrift_client:send_call(Client, append, [Event])),
+buffering(Message, #state{batch_size = BatchSize,
+						  buffer = Buffer} = State) ->
+	State1 = State#state{buffer = queue:in(Message, Buffer)},
+	case queue:len(State1#state.buffer) >= BatchSize of
+		true ->
+			{ok, State2} = handle_event(flush, State1),
+			State2;
+		_ ->
+			State1
+	end.
+
+to_flume(Event, Client) when is_record(Event, 'ThriftFlumeEvent')->
+	thrift_rpc(Client, append, Event);
+
+to_flume([Event], Client) when is_record(Event, 'ThriftFlumeEvent')->
+	thrift_rpc(Client, append, Event);
+
+to_flume([Event|_] = Events, Client) when is_record(Event, 'ThriftFlumeEvent')->
+	thrift_rpc(Client, appendBatch, Events).
+
+thrift_rpc(Client, Func, Arg) ->
+	{Client1, Res} = (catch thrift_client:send_call(Client, Func, [Arg])),
 	case Res of 
 		ok ->
 			Client1;
@@ -190,12 +229,6 @@ to_flume(Client, Event) when is_record(Event, 'ThriftFlumeEvent')->
 			?INT_LOG(error, "Unknown monster from flume server: ~p~n", [Unknown]),
 			undefined
 	end.
-
-to_flume(Client, Message, Formatter, FormatConfig) ->
-	MsgBody = Formatter:format(Message, FormatConfig),
-	Event = #'ThriftFlumeEvent'{
-			   body = lists:flatten(MsgBody)},
-	to_flume(Client, Event).
 
 %% convert the configuration into a hopefully unique gen_event ID
 config_to_id([Host, Port, _Level]) ->
