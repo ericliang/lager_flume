@@ -21,7 +21,7 @@
 
 -record(state, {id, level, formatter, format_config,
 				client, last_time, host, port,
-				shaper, batch_size, buffer}).
+				shaper, batch_size, buffer, flush_timer}).
 
 -define(DEFAULT_FORMAT,[date, " ", time,
 						" [", severity, "] ",
@@ -36,6 +36,7 @@
 -define(NET_TIMEOUT, 1000). %% in milliseconds
 -define(RECONNECT_INTERVAL, 1000000). %% in microseconds
 -define(DEFAULT_BATCH_SIZE, 1).
+-define(DEFAULT_FLUSH_INTERVAL, 1000). %% 1s
 
 %% @private
 init([Host, Port, Level]) ->
@@ -52,6 +53,7 @@ init([Host, Port, Level, BatchSize,
 		{Client, Last} ->
             try parse_level(Level) of
                 Lvl ->
+					Timer = erlang:send_after(?DEFAULT_FLUSH_INTERVAL,self(),flush),
                     {ok, #state{id = config_to_id([Host, Port, Level]),
 								level=Lvl,
 								formatter=Formatter,
@@ -62,7 +64,8 @@ init([Host, Port, Level, BatchSize,
 								port = Port,
 								shaper = #lager_shaper{hwm = undefined},
 								batch_size = BatchSize,
-								buffer = queue:new()}}
+								buffer = queue:new(),
+								flush_timer = Timer}}
 			catch
 				_:_ ->
 					{error, bad_log_level}
@@ -164,10 +167,16 @@ handle_event({log, Message}, #state{level=Level,
             {ok, State}
     end;
 
-handle_event(flush, #state{formatter=Formatter,
+handle_event(_Event, State) ->
+    {ok, State}.
+
+%% @private
+handle_info(flush, #state{formatter=Formatter,
 						   format_config=FormatConfig,
 						   client = Client,
-						   buffer = Buffer} = State) ->
+						   buffer = Buffer,
+						  flush_timer = Timer} = State) ->
+	erlang:cancel_timer(Timer),
 	Events = lists:map(
 			   fun(Message) ->					   
 					   MsgBody = Formatter:format(Message, FormatConfig),
@@ -175,12 +184,10 @@ handle_event(flush, #state{formatter=Formatter,
 			   end, queue:to_list(Buffer)),
 
 	Client1 = to_flume(Events, Client),
-	{ok, State#state{client=Client1, buffer = queue:new()}};
+	Timer1 = erlang:send_after(?DEFAULT_FLUSH_INTERVAL, self(), flush),
+	{ok, State#state{client=Client1, buffer = queue:new(), 
+					 flush_timer = Timer1}};
 
-handle_event(_Event, State) ->
-    {ok, State}.
-
-%% @private
 handle_info(_Info, State) ->
     {ok, State}.
 
@@ -201,7 +208,7 @@ buffering(Message, #state{batch_size = BatchSize,
 	State1 = State#state{buffer = queue:in(Message, Buffer)},
 	case queue:len(State1#state.buffer) >= BatchSize of
 		true ->
-			{ok, State2} = handle_event(flush, State1),
+			{ok, State2} = handle_info(flush, State1),
 			State2;
 		_ ->
 			State1
@@ -209,6 +216,9 @@ buffering(Message, #state{batch_size = BatchSize,
 
 to_flume(Event, Client) when is_record(Event, 'ThriftFlumeEvent')->
 	thrift_rpc(Client, append, Event);
+
+to_flume([], Client) ->
+	Client;
 
 to_flume([Event], Client) when is_record(Event, 'ThriftFlumeEvent')->
 	thrift_rpc(Client, append, Event);
