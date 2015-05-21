@@ -112,6 +112,13 @@ handle_call({set_loghwm, Hwm}, #state{shaper=Shaper} = State) ->
 		false ->
             {ok, {error, bad_log_hwm}, State}
     end;
+handle_call({set_log_batchsize, Size}, State) ->
+	case is_integer(Size) andalso Size > 0 of
+		true ->
+            {ok, ok, State#state{batch_size=Size}};
+		false ->
+            {ok, {error, bad_log_batch_size}, State}
+    end;
 handle_call(_Request, State) ->
     {ok, ok, State}.
 
